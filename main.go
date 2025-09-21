@@ -57,16 +57,28 @@ type ShellySettings struct {
 	Hostname string `json:"hostname"` // Fallback hostname
 }
 
+// ShellyDevice represents a discovered Shelly device
+type ShellyDevice struct {
+	IP         string
+	DeviceID   string
+	DeviceName string
+	DeviceType string
+	LastSeen   time.Time
+}
+
 // ShellyExporter implements prometheus.Collector
 type ShellyExporter struct {
-	powerGauge   *prometheus.GaugeVec
-	mutex        sync.RWMutex
-	networkRange string
-	scanInterval time.Duration
+	powerGauge        *prometheus.GaugeVec
+	mutex             sync.RWMutex
+	devicesMutex      sync.RWMutex
+	knownDevices      map[string]*ShellyDevice
+	networkRange      string
+	discoveryInterval time.Duration
+	metricsInterval   time.Duration
 }
 
 // NewShellyExporter creates a new Shelly exporter
-func NewShellyExporter(networkRange string, scanInterval time.Duration) *ShellyExporter {
+func NewShellyExporter(networkRange string, discoveryInterval, metricsInterval time.Duration) *ShellyExporter {
 	return &ShellyExporter{
 		powerGauge: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -75,8 +87,10 @@ func NewShellyExporter(networkRange string, scanInterval time.Duration) *ShellyE
 			},
 			[]string{"device_id", "device_name", "device_type", "ip_address"},
 		),
-		networkRange: networkRange,
-		scanInterval: scanInterval,
+		knownDevices:      make(map[string]*ShellyDevice),
+		networkRange:      networkRange,
+		discoveryInterval: discoveryInterval,
+		metricsInterval:   metricsInterval,
 	}
 }
 
@@ -93,19 +107,15 @@ func (e *ShellyExporter) Collect(ch chan<- prometheus.Metric) {
 	e.powerGauge.Collect(ch)
 }
 
-// scanNetwork scans the network for Shelly devices
-func (e *ShellyExporter) scanNetwork(ctx context.Context) {
-	log.Printf("Starting network scan for Shelly devices...")
+// discoverDevices scans the network for Shelly devices and updates the known devices list
+func (e *ShellyExporter) discoverDevices(ctx context.Context) {
+	log.Printf("Starting device discovery scan...")
 	start := time.Now()
-
-	e.mutex.Lock()
-	// Reset metrics
-	e.powerGauge.Reset()
-	e.mutex.Unlock()
 
 	var wg sync.WaitGroup
 	foundDevices := 0
 	var foundMutex sync.Mutex
+	tempDevices := make(map[string]*ShellyDevice)
 
 	// Get local network range
 	ips := e.getIPRange()
@@ -122,21 +132,147 @@ func (e *ShellyExporter) scanNetwork(ctx context.Context) {
 			default:
 			}
 
-			if e.isShellyDevice(ipAddr) {
+			if device := e.discoverShellyDevice(ipAddr); device != nil {
 				foundMutex.Lock()
 				foundDevices++
+				tempDevices[device.IP] = device
 				foundMutex.Unlock()
-
-				e.collectShellyMetrics(ipAddr)
 			}
 		}(ip)
 	}
 
 	wg.Wait()
 
+	// Update known devices list
+	e.devicesMutex.Lock()
+	e.knownDevices = tempDevices
+	e.devicesMutex.Unlock()
+
 	duration := time.Since(start).Seconds()
 
-	log.Printf("Network scan completed in %.2f seconds, found %d Shelly devices", duration, foundDevices)
+	log.Printf("Device discovery completed in %.2f seconds, found %d Shelly devices", duration, foundDevices)
+}
+
+// discoverShellyDevice checks if the given IP is a Shelly device and returns device info
+func (e *ShellyExporter) discoverShellyDevice(ip string) *ShellyDevice {
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	// Check if it's a Shelly device
+	resp, err := client.Get(fmt.Sprintf("http://%s/shelly", ip))
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Error closing response body: %v", err)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	var info ShellyInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil
+	}
+
+	if info.Type == "" {
+		return nil
+	}
+
+	// Generate device ID from MAC address
+	deviceID := fmt.Sprintf("shelly%s-%s", strings.ToLower(info.Type), strings.ToLower(info.Mac[len(info.Mac)-6:]))
+
+	// Get device settings for device name
+	var deviceName string
+	settingsResp, err := client.Get(fmt.Sprintf("http://%s/settings", ip))
+	if err != nil {
+		deviceName = deviceID // Fallback to device ID
+	} else {
+		defer func() {
+			if err := settingsResp.Body.Close(); err != nil {
+				log.Printf("Error closing response body: %v", err)
+			}
+		}()
+		var settings ShellySettings
+		if err := json.NewDecoder(settingsResp.Body).Decode(&settings); err != nil {
+			deviceName = deviceID // Fallback to device ID
+		} else {
+			// Try to get device name from various possible locations
+			if settings.Name != "" {
+				deviceName = settings.Name
+			} else if settings.Device.Name != "" {
+				deviceName = settings.Device.Name
+			} else if settings.Device.Hostname != "" {
+				deviceName = settings.Device.Hostname
+			} else if settings.Hostname != "" {
+				deviceName = settings.Hostname
+			} else {
+				deviceName = deviceID // Final fallback
+			}
+		}
+	}
+
+	return &ShellyDevice{
+		IP:         ip,
+		DeviceID:   deviceID,
+		DeviceName: deviceName,
+		DeviceType: info.Type,
+		LastSeen:   time.Now(),
+	}
+}
+
+// collectMetricsFromKnownDevices collects metrics from all known Shelly devices
+func (e *ShellyExporter) collectMetricsFromKnownDevices(ctx context.Context) {
+	e.devicesMutex.RLock()
+	devices := make([]*ShellyDevice, 0, len(e.knownDevices))
+	for _, device := range e.knownDevices {
+		devices = append(devices, device)
+	}
+	e.devicesMutex.RUnlock()
+
+	if len(devices) == 0 {
+		log.Printf("No known devices to collect metrics from")
+		return
+	}
+
+	log.Printf("Collecting metrics from %d known devices...", len(devices))
+	start := time.Now()
+
+	e.mutex.Lock()
+	// Reset metrics
+	e.powerGauge.Reset()
+	e.mutex.Unlock()
+
+	var wg sync.WaitGroup
+	successCount := 0
+	var successMutex sync.Mutex
+
+	// Collect metrics from each known device
+	for _, device := range devices {
+		wg.Add(1)
+		go func(dev *ShellyDevice) {
+			defer wg.Done()
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			if e.collectShellyMetrics(dev.IP, dev.DeviceID, dev.DeviceName, dev.DeviceType) {
+				successMutex.Lock()
+				successCount++
+				successMutex.Unlock()
+			}
+		}(device)
+	}
+
+	wg.Wait()
+
+	duration := time.Since(start).Seconds()
+	log.Printf("Metrics collection completed in %.2f seconds, collected from %d/%d devices", duration, successCount, len(devices))
 }
 
 // getIPRange returns a list of IP addresses in the local network range
@@ -172,94 +308,15 @@ func inc(ip net.IP) {
 	}
 }
 
-// isShellyDevice checks if the given IP is a Shelly device
-func (e *ShellyExporter) isShellyDevice(ip string) bool {
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	resp, err := client.Get(fmt.Sprintf("http://%s/shelly", ip))
-	if err != nil {
-		return false
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Printf("Error closing response body: %v", err)
-		}
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-
-	var info ShellyInfo
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return false
-	}
-
-	return info.Type != ""
-}
-
-// collectShellyMetrics collects metrics from a Shelly device
-func (e *ShellyExporter) collectShellyMetrics(ip string) {
+// collectShellyMetrics collects metrics from a Shelly device using known device info
+func (e *ShellyExporter) collectShellyMetrics(ip, deviceID, deviceName, deviceType string) bool {
 	client := &http.Client{Timeout: 5 * time.Second}
-
-	// Get device info
-	infoResp, err := client.Get(fmt.Sprintf("http://%s/shelly", ip))
-	if err != nil {
-		log.Printf("Error getting device info from %s: %v", ip, err)
-		return
-	}
-	defer func() {
-		if err := infoResp.Body.Close(); err != nil {
-			log.Printf("Error closing response body: %v", err)
-		}
-	}()
-
-	var info ShellyInfo
-	if err := json.NewDecoder(infoResp.Body).Decode(&info); err != nil {
-		log.Printf("Error decoding device info from %s: %v", ip, err)
-		return
-	}
-
-	// Generate device ID from MAC address (since /shelly endpoint doesn't have id field)
-	deviceID := fmt.Sprintf("shelly%s-%s", strings.ToLower(info.Type), strings.ToLower(info.Mac[len(info.Mac)-6:]))
-
-	// Get device settings for device name
-	var deviceName string
-	settingsResp, err := client.Get(fmt.Sprintf("http://%s/settings", ip))
-	if err != nil {
-		log.Printf("Warning: Could not get settings from %s: %v (using device ID as name)", ip, err)
-		deviceName = deviceID // Fallback to device ID
-	} else {
-		defer func() {
-			if err := settingsResp.Body.Close(); err != nil {
-				log.Printf("Error closing response body: %v", err)
-			}
-		}()
-		var settings ShellySettings
-		if err := json.NewDecoder(settingsResp.Body).Decode(&settings); err != nil {
-			log.Printf("Warning: Could not decode settings from %s: %v (using device ID as name)", ip, err)
-			deviceName = deviceID // Fallback to device ID
-		} else {
-			// Try to get device name from various possible locations
-			if settings.Name != "" {
-				deviceName = settings.Name
-			} else if settings.Device.Name != "" {
-				deviceName = settings.Device.Name
-			} else if settings.Device.Hostname != "" {
-				deviceName = settings.Device.Hostname
-			} else if settings.Hostname != "" {
-				deviceName = settings.Hostname
-			} else {
-				deviceName = deviceID // Final fallback
-			}
-		}
-	}
 
 	// Get device status
 	statusResp, err := client.Get(fmt.Sprintf("http://%s/status", ip))
 	if err != nil {
 		log.Printf("Error getting status from %s: %v", ip, err)
-		return
+		return false
 	}
 	defer func() {
 		if err := statusResp.Body.Close(); err != nil {
@@ -270,7 +327,7 @@ func (e *ShellyExporter) collectShellyMetrics(ip string) {
 	var status ShellyStatus
 	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
 		log.Printf("Error decoding status from %s: %v", ip, err)
-		return
+		return false
 	}
 
 	e.mutex.Lock()
@@ -282,21 +339,22 @@ func (e *ShellyExporter) collectShellyMetrics(ip string) {
 			e.powerGauge.WithLabelValues(
 				deviceID,
 				deviceName,
-				info.Type,
+				deviceType,
 				ip,
 			).Set(meter.Power)
 		}
 	}
 
-	log.Printf("Collected metrics from Shelly device %s ('%s', %s) at %s", deviceID, deviceName, info.Type, ip)
+	log.Printf("Collected metrics from Shelly device %s ('%s', %s) at %s", deviceID, deviceName, deviceType, ip)
+	return true
 }
 
-// startPeriodicScan starts the periodic network scanning
-func (e *ShellyExporter) startPeriodicScan(ctx context.Context) {
-	// Initial scan
-	e.scanNetwork(ctx)
+// startPeriodicDiscovery starts the periodic device discovery
+func (e *ShellyExporter) startPeriodicDiscovery(ctx context.Context) {
+	// Initial discovery
+	e.discoverDevices(ctx)
 
-	ticker := time.NewTicker(e.scanInterval)
+	ticker := time.NewTicker(e.discoveryInterval)
 	defer ticker.Stop()
 
 	for {
@@ -304,7 +362,28 @@ func (e *ShellyExporter) startPeriodicScan(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			e.scanNetwork(ctx)
+			e.discoverDevices(ctx)
+		}
+	}
+}
+
+// startPeriodicMetricsCollection starts the periodic metrics collection from known devices
+func (e *ShellyExporter) startPeriodicMetricsCollection(ctx context.Context) {
+	// Wait a bit for initial discovery to complete
+	time.Sleep(5 * time.Second)
+
+	// Initial metrics collection
+	e.collectMetricsFromKnownDevices(ctx)
+
+	ticker := time.NewTicker(e.metricsInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.collectMetricsFromKnownDevices(ctx)
 		}
 	}
 }
@@ -320,13 +399,19 @@ func getEnv(key, defaultValue string) string {
 func main() {
 	// Configuration - can be overridden by environment variables
 	networkRange := getEnv("NETWORK_RANGE", "10.10.10.0/24")
-	scanIntervalStr := getEnv("SCAN_INTERVAL", "30s")
+	discoveryIntervalStr := getEnv("DISCOVERY_INTERVAL", "30s")
+	metricsIntervalStr := getEnv("METRICS_INTERVAL", "10s")
 	port := getEnv("HTTP_PORT", ":8080")
 
-	// Parse scan interval
-	scanInterval, err := time.ParseDuration(scanIntervalStr)
+	// Parse intervals
+	discoveryInterval, err := time.ParseDuration(discoveryIntervalStr)
 	if err != nil {
-		log.Fatalf("Invalid scan interval '%s': %v", scanIntervalStr, err)
+		log.Fatalf("Invalid discovery interval '%s': %v", discoveryIntervalStr, err)
+	}
+
+	metricsInterval, err := time.ParseDuration(metricsIntervalStr)
+	if err != nil {
+		log.Fatalf("Invalid metrics interval '%s': %v", metricsIntervalStr, err)
 	}
 
 	// Ensure port starts with ':'
@@ -336,20 +421,22 @@ func main() {
 
 	log.Printf("Starting Shelly Prometheus Exporter")
 	log.Printf("Network range: %s", networkRange)
-	log.Printf("Scan interval: %s", scanInterval)
+	log.Printf("Device discovery interval: %s", discoveryInterval)
+	log.Printf("Metrics collection interval: %s", metricsInterval)
 	log.Printf("Metrics endpoint: http://localhost%s/metrics", port)
 
 	// Create exporter
-	exporter := NewShellyExporter(networkRange, scanInterval)
+	exporter := NewShellyExporter(networkRange, discoveryInterval, metricsInterval)
 
 	// Register with Prometheus
 	prometheus.MustRegister(exporter)
 
-	// Start periodic scanning in background
+	// Start periodic processes in background
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go exporter.startPeriodicScan(ctx)
+	go exporter.startPeriodicDiscovery(ctx)
+	go exporter.startPeriodicMetricsCollection(ctx)
 
 	// Setup HTTP server for metrics
 	http.Handle("/metrics", promhttp.Handler())
@@ -362,9 +449,10 @@ func main() {
 <h1>Shelly Prometheus Exporter</h1>
 <p><a href="/metrics">Metrics</a></p>
 <p>Network range: %s</p>
-<p>Scan interval: %s</p>
+<p>Device discovery interval: %s</p>
+<p>Metrics collection interval: %s</p>
 </body>
-</html>`, networkRange, scanInterval); err != nil {
+</html>`, networkRange, discoveryInterval, metricsInterval); err != nil {
 			log.Printf("Error writing HTTP response: %v", err)
 		}
 	})
