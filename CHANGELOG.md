@@ -1,3 +1,9 @@
+## [1.0.3](https://github.com/yggdrion/gsp/compare/v1.0.2...v1.0.3) (2025-09-21)
+
+### Bug Fixes
+
+* discovery and update ([2d0de95](https://github.com/yggdrion/gsp/commit/2d0de95a9100daaa2748061aff75d00d08c72952))
+
 ## [1.0.2](https://github.com/yggdrion/gsp/compare/v1.0.1...v1.0.2) (2025-09-21)
 
 ### Bug Fixes
