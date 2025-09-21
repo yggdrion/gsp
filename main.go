@@ -60,8 +60,6 @@ type ShellySettings struct {
 // ShellyExporter implements prometheus.Collector
 type ShellyExporter struct {
 	powerGauge   *prometheus.GaugeVec
-	scanDuration prometheus.Gauge
-	devicesFound prometheus.Gauge
 	mutex        sync.RWMutex
 	networkRange string
 	scanInterval time.Duration
@@ -77,18 +75,6 @@ func NewShellyExporter(networkRange string, scanInterval time.Duration) *ShellyE
 			},
 			[]string{"device_id", "device_name", "device_type", "ip_address"},
 		),
-		scanDuration: prometheus.NewGauge(
-			prometheus.GaugeOpts{
-				Name: "shelly_scan_duration_seconds",
-				Help: "Duration of the last network scan in seconds",
-			},
-		),
-		devicesFound: prometheus.NewGauge(
-			prometheus.GaugeOpts{
-				Name: "shelly_devices_found_total",
-				Help: "Total number of Shelly devices found in the last scan",
-			},
-		),
 		networkRange: networkRange,
 		scanInterval: scanInterval,
 	}
@@ -97,8 +83,6 @@ func NewShellyExporter(networkRange string, scanInterval time.Duration) *ShellyE
 // Describe implements prometheus.Collector
 func (e *ShellyExporter) Describe(ch chan<- *prometheus.Desc) {
 	e.powerGauge.Describe(ch)
-	e.scanDuration.Describe(ch)
-	e.devicesFound.Describe(ch)
 }
 
 // Collect implements prometheus.Collector
@@ -107,8 +91,6 @@ func (e *ShellyExporter) Collect(ch chan<- prometheus.Metric) {
 	defer e.mutex.RUnlock()
 
 	e.powerGauge.Collect(ch)
-	e.scanDuration.Collect(ch)
-	e.devicesFound.Collect(ch)
 }
 
 // scanNetwork scans the network for Shelly devices
@@ -153,8 +135,6 @@ func (e *ShellyExporter) scanNetwork(ctx context.Context) {
 	wg.Wait()
 
 	duration := time.Since(start).Seconds()
-	e.scanDuration.Set(duration)
-	e.devicesFound.Set(float64(foundDevices))
 
 	log.Printf("Network scan completed in %.2f seconds, found %d Shelly devices", duration, foundDevices)
 }
