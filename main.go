@@ -200,7 +200,11 @@ func (e *ShellyExporter) isShellyDevice(ip string) bool {
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("Error closing response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return false
@@ -224,7 +228,11 @@ func (e *ShellyExporter) collectShellyMetrics(ip string) {
 		log.Printf("Error getting device info from %s: %v", ip, err)
 		return
 	}
-	defer infoResp.Body.Close()
+	defer func() {
+		if err := infoResp.Body.Close(); err != nil {
+			log.Printf("Error closing response body: %v", err)
+		}
+	}()
 
 	var info ShellyInfo
 	if err := json.NewDecoder(infoResp.Body).Decode(&info); err != nil {
@@ -242,7 +250,11 @@ func (e *ShellyExporter) collectShellyMetrics(ip string) {
 		log.Printf("Warning: Could not get settings from %s: %v (using device ID as name)", ip, err)
 		deviceName = deviceID // Fallback to device ID
 	} else {
-		defer settingsResp.Body.Close()
+		defer func() {
+			if err := settingsResp.Body.Close(); err != nil {
+				log.Printf("Error closing response body: %v", err)
+			}
+		}()
 		var settings ShellySettings
 		if err := json.NewDecoder(settingsResp.Body).Decode(&settings); err != nil {
 			log.Printf("Warning: Could not decode settings from %s: %v (using device ID as name)", ip, err)
@@ -269,7 +281,11 @@ func (e *ShellyExporter) collectShellyMetrics(ip string) {
 		log.Printf("Error getting status from %s: %v", ip, err)
 		return
 	}
-	defer statusResp.Body.Close()
+	defer func() {
+		if err := statusResp.Body.Close(); err != nil {
+			log.Printf("Error closing response body: %v", err)
+		}
+	}()
 
 	var status ShellyStatus
 	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
@@ -359,7 +375,7 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, `
+		if _, err := fmt.Fprintf(w, `
 <html>
 <head><title>Shelly Prometheus Exporter</title></head>
 <body>
@@ -368,7 +384,9 @@ func main() {
 <p>Network range: %s</p>
 <p>Scan interval: %s</p>
 </body>
-</html>`, networkRange, scanInterval)
+</html>`, networkRange, scanInterval); err != nil {
+			log.Printf("Error writing HTTP response: %v", err)
+		}
 	})
 
 	log.Printf("Starting HTTP server on %s", port)
