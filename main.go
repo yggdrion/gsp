@@ -109,7 +109,7 @@ func (e *ShellyExporter) Collect(ch chan<- prometheus.Metric) {
 
 // discoverDevices scans the network for Shelly devices and updates the known devices list
 func (e *ShellyExporter) discoverDevices(ctx context.Context) {
-	log.Printf("Starting device discovery scan...")
+	// log.Printf("Starting device discovery scan...")
 	start := time.Now()
 
 	var wg sync.WaitGroup
@@ -237,7 +237,7 @@ func (e *ShellyExporter) collectMetricsFromKnownDevices(ctx context.Context) {
 		return
 	}
 
-	log.Printf("Collecting metrics from %d known devices...", len(devices))
+	// log.Printf("Collecting metrics from %d known devices...", len(devices))
 	start := time.Now()
 
 	e.mutex.Lock()
@@ -345,7 +345,7 @@ func (e *ShellyExporter) collectShellyMetrics(ip, deviceID, deviceName, deviceTy
 		}
 	}
 
-	log.Printf("Collected metrics from Shelly device %s ('%s', %s) at %s", deviceID, deviceName, deviceType, ip)
+	// log.Printf("Collected metrics from Shelly device %s ('%s', %s) at %s", deviceID, deviceName, deviceType, ip)
 	return true
 }
 
@@ -399,7 +399,7 @@ func getEnv(key, defaultValue string) string {
 func main() {
 	// Configuration - can be overridden by environment variables
 	networkRange := getEnv("NETWORK_RANGE", "10.10.10.0/24")
-	discoveryIntervalStr := getEnv("DISCOVERY_INTERVAL", "30s")
+	discoveryIntervalStr := getEnv("DISCOVERY_INTERVAL", "60s")
 	metricsIntervalStr := getEnv("METRICS_INTERVAL", "10s")
 	port := getEnv("HTTP_PORT", ":8080")
 
