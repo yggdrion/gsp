@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,15 +39,27 @@ type ShellyStatus struct {
 type ShellyInfo struct {
 	Type        string `json:"type"`
 	Mac         string `json:"mac"`
-	AuthEnabled bool   `json:"auth_en"`
+	AuthEnabled bool   `json:"auth"`
 	FwVersion   string `json:"fw"`
-	DeviceID    string `json:"id"`
+	NumOutputs  int    `json:"num_outputs"`
+	NumMeters   int    `json:"num_meters"`
+}
+
+// ShellySettings represents device settings from a Shelly device
+type ShellySettings struct {
+	Device struct {
+		Type     string `json:"type"`
+		Mac      string `json:"mac"`
+		Hostname string `json:"hostname"`
+		Name     string `json:"name"`
+	} `json:"device"`
+	Name     string `json:"name"`     // Some devices put the name at root level
+	Hostname string `json:"hostname"` // Fallback hostname
 }
 
 // ShellyExporter implements prometheus.Collector
 type ShellyExporter struct {
 	powerGauge   *prometheus.GaugeVec
-	deviceInfo   *prometheus.GaugeVec
 	scanDuration prometheus.Gauge
 	devicesFound prometheus.Gauge
 	mutex        sync.RWMutex
@@ -64,14 +75,7 @@ func NewShellyExporter(networkRange string, scanInterval time.Duration) *ShellyE
 				Name: "shelly_power_watts",
 				Help: "Current power consumption in watts from Shelly devices",
 			},
-			[]string{"device_id", "device_type", "mac_address", "ip_address", "meter_id"},
-		),
-		deviceInfo: prometheus.NewGaugeVec(
-			prometheus.GaugeOpts{
-				Name: "shelly_device_info",
-				Help: "Information about Shelly devices (always 1)",
-			},
-			[]string{"device_id", "device_type", "mac_address", "ip_address", "firmware_version"},
+			[]string{"device_id", "device_name", "device_type", "ip_address"},
 		),
 		scanDuration: prometheus.NewGauge(
 			prometheus.GaugeOpts{
@@ -93,7 +97,6 @@ func NewShellyExporter(networkRange string, scanInterval time.Duration) *ShellyE
 // Describe implements prometheus.Collector
 func (e *ShellyExporter) Describe(ch chan<- *prometheus.Desc) {
 	e.powerGauge.Describe(ch)
-	e.deviceInfo.Describe(ch)
 	e.scanDuration.Describe(ch)
 	e.devicesFound.Describe(ch)
 }
@@ -104,7 +107,6 @@ func (e *ShellyExporter) Collect(ch chan<- prometheus.Metric) {
 	defer e.mutex.RUnlock()
 
 	e.powerGauge.Collect(ch)
-	e.deviceInfo.Collect(ch)
 	e.scanDuration.Collect(ch)
 	e.devicesFound.Collect(ch)
 }
@@ -117,7 +119,6 @@ func (e *ShellyExporter) scanNetwork(ctx context.Context) {
 	e.mutex.Lock()
 	// Reset metrics
 	e.powerGauge.Reset()
-	e.deviceInfo.Reset()
 	e.mutex.Unlock()
 
 	var wg sync.WaitGroup
@@ -231,6 +232,37 @@ func (e *ShellyExporter) collectShellyMetrics(ip string) {
 		return
 	}
 
+	// Generate device ID from MAC address (since /shelly endpoint doesn't have id field)
+	deviceID := fmt.Sprintf("shelly%s-%s", strings.ToLower(info.Type), strings.ToLower(info.Mac[len(info.Mac)-6:]))
+
+	// Get device settings for device name
+	var deviceName string
+	settingsResp, err := client.Get(fmt.Sprintf("http://%s/settings", ip))
+	if err != nil {
+		log.Printf("Warning: Could not get settings from %s: %v (using device ID as name)", ip, err)
+		deviceName = deviceID // Fallback to device ID
+	} else {
+		defer settingsResp.Body.Close()
+		var settings ShellySettings
+		if err := json.NewDecoder(settingsResp.Body).Decode(&settings); err != nil {
+			log.Printf("Warning: Could not decode settings from %s: %v (using device ID as name)", ip, err)
+			deviceName = deviceID // Fallback to device ID
+		} else {
+			// Try to get device name from various possible locations
+			if settings.Name != "" {
+				deviceName = settings.Name
+			} else if settings.Device.Name != "" {
+				deviceName = settings.Device.Name
+			} else if settings.Device.Hostname != "" {
+				deviceName = settings.Device.Hostname
+			} else if settings.Hostname != "" {
+				deviceName = settings.Hostname
+			} else {
+				deviceName = deviceID // Final fallback
+			}
+		}
+	}
+
 	// Get device status
 	statusResp, err := client.Get(fmt.Sprintf("http://%s/status", ip))
 	if err != nil {
@@ -248,29 +280,19 @@ func (e *ShellyExporter) collectShellyMetrics(ip string) {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
 
-	// Set device info metric
-	e.deviceInfo.WithLabelValues(
-		info.DeviceID,
-		info.Type,
-		info.Mac,
-		ip,
-		info.FwVersion,
-	).Set(1)
-
 	// Set power metrics for each meter
-	for i, meter := range status.Meters {
+	for _, meter := range status.Meters {
 		if meter.IsValid {
 			e.powerGauge.WithLabelValues(
-				info.DeviceID,
+				deviceID,
+				deviceName,
 				info.Type,
-				info.Mac,
 				ip,
-				strconv.Itoa(i),
 			).Set(meter.Power)
 		}
 	}
 
-	log.Printf("Collected metrics from Shelly device %s (%s) at %s", info.DeviceID, info.Type, ip)
+	log.Printf("Collected metrics from Shelly device %s ('%s', %s) at %s", deviceID, deviceName, info.Type, ip)
 }
 
 // startPeriodicScan starts the periodic network scanning
